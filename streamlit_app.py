@@ -72,11 +72,19 @@ def process_image(img_file_buffer, rows, cols, required_count=None, analysis_mod
     
     output_img = img.copy()
     
-    # 2. 动态参数
-    approx_diameter = target_width / (cols + 0.5)
-    dynamic_min_r = int(approx_diameter / 2 * 0.7)
-    dynamic_max_r = int(approx_diameter / 2 * 1.2)
-    min_dist_param = int(approx_diameter * 0.8)
+    # --- 核心修改：针对 1x1 单孔模式的特判 ---
+    if rows == 1 and cols == 1:
+        # 单孔模式：通常图片就是对着孔拍的，孔占画面比例很大
+        # 我们允许半径在 宽度 20% 到 48% 之间 (直径 40% - 96%)
+        dynamic_min_r = int(target_width * 0.2)
+        dynamic_max_r = int(target_width * 0.48)
+        min_dist_param = int(target_width * 0.5) # 只有一个圆，间距参数其实不重要
+    else:
+        # 阵列模式：原逻辑
+        approx_diameter = target_width / (cols + 0.5)
+        dynamic_min_r = int(approx_diameter / 2 * 0.7)
+        dynamic_max_r = int(approx_diameter / 2 * 1.2)
+        min_dist_param = int(approx_diameter * 0.8)
     
     # 3. 霍夫检测
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -116,36 +124,23 @@ def process_image(img_file_buffer, rows, cols, required_count=None, analysis_mod
             score = cv2.mean(score_img, mask=mask)[0]
             candidates.append({'data': (x, y, r), 'score': score})
         
-        # --- 步骤 B: 筛选逻辑重构 (关键修改) ---
-        
-        # 1. 按分数排序
         candidates.sort(key=lambda k: k['score'], reverse=True)
         
-        # 2. 先保留“满板”数量的圆 (Rows * Cols)
-        #    注意：这里先不应用用户的 required_count，而是先填满网格。
-        #    这样可以保证颜色浅的孔（只要比背景强）也能入选。
-        max_possible_slots = rows * cols
-        if len(candidates) > max_possible_slots:
-            candidates = candidates[:max_possible_slots]
+        # 数量截取
+        target_n = required_count if (required_count and required_count > 0) else (rows * cols)
+        if len(candidates) > target_n:
+            candidates = candidates[:target_n]
         
         accepted_circles = [c['data'] for c in candidates]
         
-        # --- 步骤 C: 空间排序 (从上到下，从左到右) ---
-        # 此时我们手里的圆是乱序的，但数量是对的（或者包含了所有有效孔）
-        spatial_sorted_circles = robust_sort_circles(accepted_circles, rows)
-
-        # --- 步骤 D: 用户截断 (Apply Limit) ---
-        # 排序完成后，再根据用户滑块的数值，从尾部切断
-        # 这样就能保证减去的一定是最后几个孔
-        if required_count is not None and required_count > 0:
-            if len(spatial_sorted_circles) > required_count:
-                final_circles = spatial_sorted_circles[:required_count]
-            else:
-                final_circles = spatial_sorted_circles
+        # --- 步骤 B: 排序 ---
+        # 如果只有1个圆，不需要复杂排序，直接返回
+        if len(accepted_circles) <= 1:
+            final_circles = accepted_circles
         else:
-            final_circles = spatial_sorted_circles
+            final_circles = robust_sort_circles(accepted_circles, rows)
 
-        # --- 步骤 E: 取值与画图 ---
+        # --- 步骤 D: 取值与画图 ---
         roi_scale = 0.7 
         for i, (x, y, r) in enumerate(final_circles):
             draw_r = int(r * roi_scale)
@@ -327,7 +322,15 @@ with tab2:
         if rep.get('best_linear_range'): opts[f"最佳线性 ({rep['best_linear_range']['range_text']})"] = rep['best_linear_range']
         
         sel = opts[st.selectbox("计算模型", list(opts.keys()))]
-        limit = st.slider("样品数量", 1, rows*cols, rows*cols)
+        
+        # === 修复滑块报错逻辑 ===
+        max_samples = rows * cols
+        if max_samples > 1:
+            limit = st.slider("样品数量", 1, max_samples, max_samples)
+        else:
+            limit = 1
+            st.caption("当前模式：单孔检测 (1x1)")
+            
         up_test = st.file_uploader("上传样品", type=['jpg', 'png'], key='t')
         
         if up_test:
@@ -336,7 +339,8 @@ with tab2:
             if t_cnt > 0:
                 res = []
                 for v in t_vals: res.append(sel['inv_func'](v, *sel['params']))
-                st.dataframe({"Sample": range(1, len(res)+1), "Signal": [f"{v:.1f}" for v in t_vals], "Conc": [f"{c:.4f}" for c in res]})
+                st.dataframe({"Sample": range(1, len(res)+1), "Signal": [f"{v:.1f}" for v in t_vals], "Conc": [f"{c:.4f}" for c in res]}, use_container_width=True)
+
 
 
 
