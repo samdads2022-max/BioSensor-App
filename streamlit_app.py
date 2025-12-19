@@ -242,50 +242,81 @@ if 'fit_report' not in st.session_state: st.session_state.fit_report = None
 
 with tab1:
     uploaded_calib = st.file_uploader("上传标准品图片", type=['jpg', 'png', 'jpeg'])
+    
     if uploaded_calib:
         col1, col2 = st.columns([1,1])
-        with col1:
-            target_count = len(known_concs)
-            img, vals, count = process_image(uploaded_calib, rows, cols, target_count, analysis_mode)
-            st.image(img, channels="BGR", use_container_width=True, caption=f"识别结果 ({count}/{target_count})")
         
-        with col2:
-            if count != target_count:
-                st.error(f"⚠️ 数量不匹配！需要 {target_count}，找到 {count}。")
-            else:
-                report = auto_fit_engine(known_concs, vals)
-                st.session_state.fit_report = report
-                rec = report['recommended']
+        # --- 新增功能：标曲数量控制器 ---
+        # 默认最大值是用户输入的浓度个数
+        max_points = len(known_concs)
+        
+        if max_points < 3:
+            st.error("⚠️ 请至少输入 3 个浓度值以进行拟合。")
+        else:
+            # 1. 在这里加一个滑块，允许用户减少拟合点的数量
+            # 默认值设为 max_points (全选)
+            st.markdown("##### 🎚️ 有效标孔选择")
+            fit_count = st.slider(
+                "拟合孔数 (从第1个孔开始保留)", 
+                min_value=3, 
+                max_value=max_points, 
+                value=max_points,
+                help="如果最后几个孔（高浓度）出现异常，可以减小此数值将其剔除。"
+            )
+
+            with col1:
+                # 2. 将滑块的值传给图像处理函数
+                # process_image 会自动按照空间排序，只保留前 fit_count 个孔
+                img, vals, count = process_image(uploaded_calib, rows, cols, required_count=fit_count, analysis_mode=analysis_mode)
                 
-                st.success(f"✅ 推荐: {rec['name']}")
-                st.metric("R²", f"{rec['r2']:.4f}")
-                
-                fig, ax = plt.subplots()
-                xs = np.linspace(min(known_concs), max(known_concs), 100)
-                
-                # 画原始点
-                ax.scatter(known_concs, vals, color='black', label='Data', zorder=5)
-                
-                # 画全局推荐
-                ax.plot(xs, rec['func'](xs, *rec['params']), 'r-', linewidth=2, label='Global Fit')
-                
-                # 画局部虚线
-                br = report.get('best_linear_range')
-                if br and br['r2'] > report['linear_global']['r2'] + 0.01:
-                    i1, i2 = br['indices']
-                    ax.scatter(known_concs[i1:i2], vals[i1:i2], s=150, facecolors='none', edgecolors='lime', lw=2, label='Best Range Pts')
+                st.image(img, channels="BGR", use_container_width=True, caption=f"当前拟合前 {count} 个点")
+            
+            with col2:
+                if count != fit_count:
+                    # 这种情况通常是图片太模糊，连要求的数量都没找齐
+                    st.error(f"⚠️ 识别数量不足！计划拟合 {fit_count} 个，但只找到 {count} 个有效圆。")
+                else:
+                    # 3. 关键步骤：数据对齐
+                    # 用户可能输入了 14 个浓度，但滑块只选了 11 个
+                    # 我们必须截取前 11 个浓度，才能和 11 个 S值 对应
+                    current_x = np.array(known_concs[:count])
+                    current_y = np.array(vals)
                     
-                    local_x = np.array(br['x_range'])
-                    local_y_fit = br['func'](local_x, *br['params'])
-                    ax.plot(local_x, local_y_fit, color='lime', linestyle='--', linewidth=2.5, label=f"Local Linear (R²={br['r2']:.4f})")
+                    # 4. 运行拟合引擎
+                    report = auto_fit_engine(current_x, current_y)
+                    st.session_state.fit_report = report
+                    rec = report['recommended']
                     
-                    # 修复 NameError: 这里的 min_pts 改为写死的数字 5，或者取变量
-                    st.info(f"💡 最佳局部线性范围 (5+点): {br['range_text']} (R²={br['r2']:.4f})")
-                
-                ax.legend()
-                ax.set_xlabel("Concentration")
-                ax.set_ylabel(f"Signal ({analysis_mode})")
-                st.pyplot(fig)
+                    st.success(f"✅ 推荐模型: {rec['name']}")
+                    st.metric("R²", f"{rec['r2']:.4f}")
+                    
+                    # 5. 绘图
+                    fig, ax = plt.subplots()
+                    xs = np.linspace(min(current_x), max(current_x), 100)
+                    
+                    # 画原始数据点
+                    ax.scatter(current_x, current_y, color='black', label='Data', zorder=5)
+                    
+                    # 画拟合线
+                    ax.plot(xs, rec['func'](xs, *rec['params']), 'r-', linewidth=2, label='Fit Curve')
+                    
+                    # 画被剔除的点 (如果有的话，用灰色叉叉表示)
+                    if len(known_concs) > count:
+                        ignored_x = known_concs[count:]
+                        # 这里没法画对应的Y值，因为没取出来，但在逻辑上提示用户即可
+                        st.caption(f"已忽略末尾 {len(known_concs) - count} 个高浓度点")
+                    
+                    # 局部线性
+                    br = report.get('best_linear_range')
+                    if br and br['r2'] > report['linear_global']['r2']:
+                        i1, i2 = br['indices']
+                        ax.scatter(current_x[i1:i2], current_y[i1:i2], s=150, facecolors='none', edgecolors='lime', lw=2, label='Best Range')
+                        st.info(f"💡 最佳局部线性范围: {br['range_text']} (R²={br['r2']:.4f})")
+                    
+                    ax.legend()
+                    ax.set_xlabel("Concentration")
+                    ax.set_ylabel(f"Signal ({analysis_mode})")
+                    st.pyplot(fig)
 
 with tab2:
     if not st.session_state.fit_report:
@@ -306,6 +337,7 @@ with tab2:
                 res = []
                 for v in t_vals: res.append(sel['inv_func'](v, *sel['params']))
                 st.dataframe({"Sample": range(1, len(res)+1), "Signal": [f"{v:.1f}" for v in t_vals], "Conc": [f"{c:.4f}" for c in res]})
+
 
 
 
