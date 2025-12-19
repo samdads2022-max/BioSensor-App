@@ -3,16 +3,19 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy import stats
 from PIL import Image, ImageOps
 
 # ==========================================
-# 核心算法区 (更智能的排序)
+# 1. 智能图像处理模块 (动态尺度版)
 # ==========================================
-
-def process_image(img_file_buffer, rows, cols, is_standard=True):
-    # 1. 标准化缩放 (保持图片宽度为 1000px，统一所有参数的基准)
+def process_image(img_file_buffer, rows, cols):
+    # 读取并标准化图片
     image_pil = Image.open(img_file_buffer)
     image_pil = ImageOps.exif_transpose(image_pil)
+    
+    # 强制缩放到 1000px 宽，保证处理基准一致
+    # 注意：虽然宽度固定了，但如果用户裁切了图片，孔的相对大小会变
     target_width = 1000
     w_percent = (target_width / float(image_pil.size[0]))
     h_size = int((float(image_pil.size[1]) * float(w_percent)))
@@ -21,26 +24,29 @@ def process_image(img_file_buffer, rows, cols, is_standard=True):
     
     output_img = img.copy()
     
-    # 2. 图像增强 (核心步骤：让透明孔显形)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # --- 关键改进：基于网格布局动态计算半径 ---
+    # 假设图片宽度被 (cols + 0.5) 个单位瓜分 (0.5是预留的边缘空隙)
+    # 这样无论你图片裁切得多紧凑，只要列数对，孔的大小比例就算得准
+    approx_diameter = target_width / (cols + 0.5)
     
-    # 使用 CLAHE (对比度受限自适应直方图均衡化)
-    # 这步操作能极大增强透明孔边缘与背景的对比度
+    # 动态设定半径范围 (不再是写死的 35-60)
+    # 允许 0.6倍 到 1.2倍 的误差波动
+    dynamic_min_r = int(approx_diameter / 2 * 0.6)
+    dynamic_max_r = int(approx_diameter / 2 * 1.2)
+    
+    # 图像增强 (CLAHE)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced_gray = clahe.apply(gray)
-    
-    # 稍微模糊一下，去除噪点
     gray_blur = cv2.GaussianBlur(enhanced_gray, (9, 9), 2)
 
-    # 3. 霍夫圆检测
-    # 因为宽度固定1000了，这里的参数我们可以调教得非常通用
+    # 霍夫圆检测 (使用动态半径)
     circles = cv2.HoughCircles(
         gray_blur, cv2.HOUGH_GRADIENT, dp=1, 
-        minDist=80,         # 两个圆心至少相距80像素 (对于1000宽的图，这能有效防止重叠)
-        param1=50,          # 边缘检测阈值 (调低点，为了识别透明孔微弱的边缘)
-        param2=25,          # 圆心检测阈值 (越小越灵敏，为了不漏掉透明孔)
-        minRadius=35,       # 1000宽图下的经验半径
-        maxRadius=60        # 1000宽图下的经验半径
+        minDist=dynamic_min_r * 1.5,   # 间距也随圆大小动态变化
+        param1=50, param2=25, 
+        minRadius=dynamic_min_r, 
+        maxRadius=dynamic_max_r
     )
 
     s_values = []
@@ -49,183 +55,241 @@ def process_image(img_file_buffer, rows, cols, is_standard=True):
     if circles is not None:
         circles = np.round(circles[0, :]).astype("int")
         
-        # --- 智能网格筛选 (防止找多了) ---
-        # 霍夫变换经常会找到背景里的杂物，我们需要利用 "Grid" 特性来过滤
-        
+        # --- 智能网格排序 ---
         # 1. 先按 Y 轴排序
         circles = sorted(circles, key=lambda x: x[1])
         
-        final_candidates = []
-        expected_total = rows * cols
-        
-        # 简单的聚类逻辑：
-        # 如果我们找到了 20 个圆，但只要 14 个。
-        # 我们优先保留那些 "半径大小正常" 且 "位置比较整齐" 的。
-        # 这里使用一个简单的逻辑：优先取 "Y轴最接近中间区域" 的圆 (假设板子在图中间)
-        
-        if len(circles) > expected_total:
-            # 这种简单粗暴的截取通常有效，因为霍夫通常给予强边缘更高的权重
-            # 但为了保险，我们可以根据半径过滤一下
-            # 计算中位半径
+        # 2. 过滤半径异常值 (中位数过滤，防止背景光斑干扰)
+        if len(circles) > 0:
             median_r = np.median([c[2] for c in circles])
-            # 只保留半径差异在 20% 以内的圆
-            circles = [c for c in circles if abs(c[2] - median_r) < median_r * 0.3]
-            
-            # 再次排序并截取
-            circles = sorted(circles, key=lambda x: x[1])
-            if len(circles) > expected_total:
-                 circles = circles[:expected_total]
+            # 只保留半径差异在 40% 以内的圆
+            circles = [c for c in circles if abs(c[2] - median_r) < median_r * 0.4]
+        
+        # 3. 截取预期数量
+        expected_total = rows * cols
+        if len(circles) > expected_total:
+             circles = circles[:expected_total]
 
-        # 2. 网格排序 (Row-Major)
+        # 4. 逐行排序
         for r in range(rows):
             start_idx = r * cols
             end_idx = min((r + 1) * cols, len(circles))
             if start_idx < len(circles):
-                row_circles = circles[start_idx : end_idx]
-                # 按 X 轴排序
-                row_circles = sorted(row_circles, key=lambda x: x[0])
+                row_circles = sorted(circles[start_idx:end_idx], key=lambda x: x[0])
                 sorted_circles.extend(row_circles)
 
-        # 4. 提取 S 值
+        # 5. 提取 S 值
         for i, (x, y, r) in enumerate(sorted_circles):
             # 视觉标记
             cv2.circle(output_img, (x, y), r, (0, 255, 0), 4)
-            # 在圆心画个十字，方便确认是否对准
-            cv2.line(output_img, (x-10, y), (x+10, y), (0, 0, 255), 2)
-            cv2.line(output_img, (x, y-10), (x, y+10), (0, 0, 255), 2)
+            cv2.putText(output_img, f"{i+1}", (x-15, y+5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            # 文字
-            cv2.putText(output_img, f"{i+1}", (x-20, y-20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-            
-            # 提取颜色：只取圆心中间 60% 的区域，避开边缘
             mask = np.zeros(img.shape[:2], dtype="uint8")
-            roi_r = int(r * 0.6) 
-            cv2.circle(mask, (x, y), roi_r, 255, -1)
-            
+            cv2.circle(mask, (x, y), int(r * 0.6), 255, -1)
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             mean_val = cv2.mean(hsv, mask=mask)
             s_values.append(mean_val[1])
 
     return output_img, s_values, len(sorted_circles)
 
-def exponential_decay(x, a, b, c):
+# ==========================================
+# 2. 智能拟合引擎 (新增模块)
+# ==========================================
+
+# 定义各种模型及其反函数
+def linear_func(x, k, b): 
+    return k * x + b
+
+def exp_decay_func(x, a, b, c): 
     return a * np.exp(-b * x) + c
 
-def inverse_exponential(y, a, b, c):
+def inverse_linear(y, k, b):
+    return (y - b) / k
+
+def inverse_exp(y, a, b, c):
     try:
         val = (y - c) / a
-        if val <= 0: return 0 
+        if val <= 0: return 0
         return -(1/b) * np.log(val)
+    except: return 0
+
+def auto_fit_engine(x_data, y_data):
+    """
+    全自动拟合引擎：比较线性vs非线性，并寻找最佳线性范围
+    """
+    report = {}
+    x_data = np.array(x_data)
+    y_data = np.array(y_data)
+
+    # --- A. 全局线性拟合 ---
+    slope, intercept, r_value_lin, _, _ = stats.linregress(x_data, y_data)
+    report['linear_global'] = {
+        'params': (slope, intercept),
+        'r2': r_value_lin**2,
+        'func': linear_func,
+        'inv_func': inverse_linear,
+        'name': '全局线性 (Global Linear)'
+    }
+
+    # --- B. 全局非线性拟合 (指数衰减) ---
+    try:
+        p0 = [np.max(y_data)-np.min(y_data), 0.5, np.min(y_data)]
+        popt_exp, _ = curve_fit(exp_decay_func, x_data, y_data, p0=p0, maxfev=5000)
+        residuals = y_data - exp_decay_func(x_data, *popt_exp)
+        r2_exp = 1 - (np.sum(residuals**2) / np.sum((y_data - np.mean(y_data))**2))
+        
+        report['exp_global'] = {
+            'params': popt_exp,
+            'r2': r2_exp,
+            'func': exp_decay_func,
+            'inv_func': inverse_exp,
+            'name': '指数衰减 (Exp Decay)'
+        }
     except:
-        return 0
+        report['exp_global'] = {'r2': -1} # 拟合失败标记
+
+    # --- C. 寻找最佳线性范围 (Sliding Window) ---
+    best_subset_r2 = -1
+    min_points = 4 # 至少需要4个点
+    
+    if len(x_data) >= min_points:
+        for i in range(len(x_data) - min_points + 1):
+            for j in range(i + min_points, len(x_data) + 1):
+                sub_x = x_data[i:j]
+                sub_y = y_data[i:j]
+                s, i_cept, r, _, _ = stats.linregress(sub_x, sub_y)
+                if r**2 > best_subset_r2:
+                    best_subset_r2 = r**2
+                    report['best_linear_range'] = {
+                        'range_text': f"{sub_x[0]} - {sub_x[-1]} mM",
+                        'indices': (i, j),
+                        'params': (s, i_cept),
+                        'r2': best_subset_r2,
+                        'func': linear_func,
+                        'inv_func': inverse_linear,
+                        'name': f"最佳线性范围 ({sub_x[0]}-{sub_x[-1]})"
+                    }
+    else:
+        report['best_linear_range'] = None
+
+    # --- D. 最终推荐 ---
+    # 如果指数R2比线性高出0.02以上，推荐指数，否则推荐线性
+    if report['exp_global']['r2'] > report['linear_global']['r2'] + 0.02:
+        report['recommended'] = report['exp_global']
+    else:
+        report['recommended'] = report['linear_global']
+        
+    return report
 
 # ==========================================
-# 界面显示区
+# 3. Streamlit 界面
 # ==========================================
-st.set_page_config(page_title="BioSensor Pro", layout="wide")
-st.title("🧬 生物传感器智能分析系统 ")
+st.set_page_config(page_title="BioSensor Pro Max", layout="wide")
+st.title("🧬 生物传感器智能分析系统 (Auto-Fit版)")
 
-# --- 侧边栏：全局设置 ---
+# --- 侧边栏 ---
 with st.sidebar:
     st.header("⚙️ 参数设置")
-    
-    st.subheader("1. 标准品浓度")
-    conc_input = st.text_area(
-        "输入浓度 (逗号分隔)", 
-        "0, 0.01, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0"
-    )
+    conc_input = st.text_area("标准品浓度 (mM)", "0, 0.1, 0.5, 1, 2, 4, 6, 8, 10, 15, 20")
     try:
         known_concs = [float(x.strip()) for x in conc_input.split(',')]
-        std_count = len(known_concs)
     except:
         st.error("浓度格式错误")
-        std_count = 14
-
-    st.subheader("2. 布局模式")
-    # 这里的布局仅用于排序，帮助程序知道什么时候换行
-    layout_mode = st.radio("选择板孔排列方式:", ["固定 2行 x 7列 (标准)", "自定义行列"])
+        known_concs = []
     
-    if layout_mode == "自定义行列":
-        user_rows = st.number_input("行数 (Rows)", min_value=1, value=2)
-        user_cols = st.number_input("列数 (Cols)", min_value=1, value=7)
-    else:
-        user_rows, user_cols = 2, 7
+    st.markdown("---")
+    st.subheader("阵列布局")
+    # 这里的设置将直接影响 process_image 里的动态半径计算
+    rows = st.number_input("行数 (Rows)", 1, 10, 2)
+    cols = st.number_input("列数 (Cols)", 1, 20, 7)
 
-# --- 主页面 ---
-col1, col2 = st.columns(2)
+# --- 页面逻辑 ---
+tab1, tab2 = st.tabs(["📏 建立标曲 (Calibration)", "🧪 样品检测 (Test)"])
 
-curve_params = None 
+if 'fit_report' not in st.session_state:
+    st.session_state.fit_report = None
 
-# --- 左边：标准曲线 ---
-with col1:
-    st.markdown("### 步骤 1: 建立标曲")
+with tab1:
     uploaded_calib = st.file_uploader("上传标准品图片", type=['jpg', 'png', 'jpeg'])
     
     if uploaded_calib:
-        # 智能推断：如果是2x7布局，但浓度只有5个，怎么排？
-        # 这里为了简单，标准品尽量按满排或者用户指定的行列排
-        img_show, s_vals, count = process_image(uploaded_calib, user_rows, user_cols)
+        col_img, col_res = st.columns([1, 1])
         
-        st.image(img_show, channels="BGR", use_column_width=True)
+        with col_img:
+            # 调用新版 process_image
+            img_show, s_vals, count = process_image(uploaded_calib, rows, cols)
+            st.image(img_show, channels="BGR", use_container_width=True, caption=f"识别到 {count} 个孔")
         
-        if count != std_count:
-            st.warning(f"⚠️ 数量警告: 输入了 {std_count} 个浓度，但检测到 {count} 个孔。")
-            st.info("提示：请检查左侧'布局模式'是否设置正确，或调整图片拍摄角度。")
-        else:
-            st.success(f"✅ 成功匹配 {count} 个点")
-            
-            # 拟合
-            x_data = np.array(known_concs)
-            y_data = np.array(s_vals)
-            p0 = [np.max(y_data)-np.min(y_data), 0.5, np.min(y_data)]
-            try:
-                popt, pcov = curve_fit(exponential_decay, x_data, y_data, p0=p0, maxfev=5000)
-                curve_params = popt
+        with col_res:
+            if count != len(known_concs):
+                st.warning(f"⚠️ 数量不匹配：浓度有 {len(known_concs)} 个，但识别到 {count} 个孔。")
+                st.info("提示：请检查侧边栏的‘阵列布局’是否正确，这会影响孔径识别。")
+            else:
+                # 运行拟合引擎
+                report = auto_fit_engine(known_concs, s_vals)
+                st.session_state.fit_report = report
                 
-                # R2计算
-                residuals = y_data - exponential_decay(x_data, *popt)
-                ss_res = np.sum(residuals**2)
-                ss_tot = np.sum((y_data - np.mean(y_data))**2)
-                r2 = 1 - (ss_res / ss_tot)
+                rec_model = report['recommended']
+                st.success(f"✅ 推荐模型：{rec_model['name']}")
+                st.metric("拟合优度 (R²)", f"{rec_model['r2']:.4f}")
                 
-                # 画图
-                fig, ax = plt.subplots(figsize=(5, 3)) # 图小一点
-                ax.scatter(x_data, y_data, color='blue', alpha=0.6)
-                x_smooth = np.linspace(min(x_data), max(x_data), 100)
-                ax.plot(x_smooth, exponential_decay(x_smooth, *popt), 'r--')
-                ax.set_title(f"Fit: R²={r2:.4f}")
-                st.pyplot(fig)
+                # 绘图
+                fig, ax = plt.subplots()
+                x_smooth = np.linspace(min(known_concs), max(known_concs), 100)
                 
-            except Exception as e:
-                st.error(f"拟合失败: {e}")
+                # 原始点
+                ax.scatter(known_concs, s_vals, color='black', label='Raw Data', zorder=5)
+                
+                # 绘制推荐曲线
+                y_fit = rec_model['func'](x_smooth, *rec_model['params'])
+                ax.plot(x_smooth, y_fit, 'r-', label='Recommended Fit')
+                
+                # 如果有最佳线性范围，额外画绿线
+                best_range = report.get('best_linear_range')
+                if best_range and best_range['r2'] > report['linear_global']['r2']:
+                    idx1, idx2 = best_range['indices']
+                    ax.scatter(known_concs[idx1:idx2], s_vals[idx1:idx2], 
+                               s=100, facecolors='none', edgecolors='lime', linewidth=2, label='Best Linear Range')
+                    st.info(f"💡 发现更优的局部线性范围：{best_range['range_text']} (R²={best_range['r2']:.4f})")
 
-# --- 右边：未知样品 ---
-with col2:
-    st.markdown("### 步骤 2: 检测样品")
-    
-    if curve_params is None:
-        st.info("👈 等待标曲建立...")
+                ax.legend()
+                ax.set_xlabel("Concentration")
+                ax.set_ylabel("Signal S")
+                st.pyplot(fig)
+
+with tab2:
+    if st.session_state.fit_report is None:
+        st.info("👈 请先在‘建立标曲’页面完成分析")
     else:
-        uploaded_test = st.file_uploader("上传样品图片", type=['jpg', 'png', 'jpeg'], key="test")
+        report = st.session_state.fit_report
         
-        if uploaded_test:
-            # 这里的巧妙之处：我们传入用户设定的 rows/cols
-            # 这样即使用户传了一张只有 1行 3个孔 的图，只要设成 1行 3列，就能正确识别
-            img_test_show, s_vals_test, count_test = process_image(uploaded_test, user_rows, user_cols)
+        # 让用户选择用哪个模型
+        options = {
+            "智能推荐": report['recommended'],
+            "全局线性": report['linear_global'],
+            "全局非线性": report['exp_global']
+        }
+        if report.get('best_linear_range'):
+            options[f"最佳线性范围 ({report['best_linear_range']['range_text']})"] = report['best_linear_range']
             
-            st.image(img_test_show, channels="BGR", use_column_width=True)
-            st.write(f"检测到 {count_test} 个样品")
+        choice = st.selectbox("选择计算模型：", list(options.keys()))
+        selected_model = options[choice]
+        
+        uploaded_test = st.file_uploader("上传待测样品", type=['jpg', 'png', 'jpeg'], key='test')
+        if uploaded_test:
+            img_test, s_test, count_test = process_image(uploaded_test, rows, cols)
+            st.image(img_test, channels="BGR", caption=f"检测到 {count_test} 个样品")
             
             if count_test > 0:
                 results = []
-                for s in s_vals_test:
-                    conc = inverse_exponential(s, *curve_params)
+                for s in s_test:
+                    # 使用选中模型的反函数
+                    conc = selected_model['inv_func'](s, *selected_model['params'])
                     results.append(conc)
                 
-                # 结果展示优化
                 st.dataframe({
-                    "孔号": [f"#{i+1}" for i in range(len(results))],
-                    "S值": [f"{v:.1f}" for v in s_vals_test],
-                    "预测浓度 (mM)": [f"{c:.4f}" for c in results]
+                    "Sample": [f"#{i+1}" for i in range(len(results))],
+                    "S-Value": [f"{v:.1f}" for v in s_test],
+                    "Conc (mM)": [f"{c:.4f}" for c in results]
                 }, use_container_width=True)
