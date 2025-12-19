@@ -10,9 +10,6 @@ from PIL import Image, ImageOps
 # 1. 智能图像处理模块 (动态尺度 + 数量锁定版)
 # ==========================================
 def process_image(img_file_buffer, rows, cols, required_count=None):
-    """
-    required_count: 如果指定了数量(比如11)，则只输出前11个孔，后面的忽略。
-    """
     # 1. 标准化缩放
     image_pil = Image.open(img_file_buffer)
     image_pil = ImageOps.exif_transpose(image_pil)
@@ -26,9 +23,9 @@ def process_image(img_file_buffer, rows, cols, required_count=None):
     
     # 2. 动态参数计算
     approx_diameter = target_width / (cols + 0.5)
-    dynamic_min_r = int(approx_diameter / 2 * 0.75) 
-    dynamic_max_r = int(approx_diameter / 2 * 1.1)
-    min_dist_param = int(approx_diameter * 0.85)
+    dynamic_min_r = int(approx_diameter / 2 * 0.7)  # 稍微放宽范围，确保能选中
+    dynamic_max_r = int(approx_diameter / 2 * 1.2)
+    min_dist_param = int(approx_diameter * 0.8)     # 防止重叠
     
     # 3. 图像增强
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -36,75 +33,91 @@ def process_image(img_file_buffer, rows, cols, required_count=None):
     enhanced_gray = clahe.apply(gray)
     gray_blur = cv2.GaussianBlur(enhanced_gray, (9, 9), 2)
 
-    # 4. 霍夫圆检测 (定位塑料外壁)
+    # 4. 霍夫圆检测
     circles = cv2.HoughCircles(
         gray_blur, cv2.HOUGH_GRADIENT, dp=1, 
         minDist=min_dist_param,
         param1=50, 
-        param2=30,
+        param2=25, # 保持灵敏，先多找点，后面再筛
         minRadius=dynamic_min_r, 
         maxRadius=dynamic_max_r
     )
 
     s_values = []
-    sorted_circles = []
+    final_circles = []
 
     if circles is not None:
         circles = np.round(circles[0, :]).astype("int")
         
-        # --- 排序与过滤 ---
-        # 1. 过滤背景杂质
-        circles = sorted(circles, key=lambda x: x[1])
-        if len(circles) > 0:
-            median_r = np.median([c[2] for c in circles])
-            circles = [c for c in circles if abs(c[2] - median_r) < median_r * 0.4]
+        # --- 关键修改：基于“颜色信息”的优胜劣汰 ---
         
-        # 2. 截取最大可能数量 (rows * cols)
-        max_possible = rows * cols
-        if len(circles) > max_possible:
-             circles = circles[:max_possible]
-
-        # 3. 严格的网格排序 (Row-Major)
-        circles = sorted(circles, key=lambda x: x[1]) # 先按Y排
-        temp_sorted = []
+        # 第一步：给每一个候选圆“打分”
+        # 我们计算每个圆内的“平均饱和度(S)”，因为样品肯定比塑料背景更有颜色
+        candidates = []
+        hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        for (x, y, r) in circles:
+            # 越界检查
+            if y < 0 or x < 0 or y >= img.shape[0] or x >= img.shape[1]: continue
+            
+            # 取圆心小区域计算饱和度
+            mask = np.zeros(img.shape[:2], dtype="uint8")
+            cv2.circle(mask, (x, y), int(r * 0.6), 255, -1)
+            mean_val = cv2.mean(hsv_img, mask=mask)
+            saturation_score = mean_val[1] # S通道作为分数
+            
+            candidates.append({
+                'data': (x, y, r),
+                'score': saturation_score
+            })
+        
+        # 第二步：按分数(饱和度)从高到低排序
+        # 这样，有颜色的孔会排在最前面，灰色的塑料阴影排在最后
+        candidates.sort(key=lambda k: k['score'], reverse=True)
+        
+        # 第三步：录取前 N 名
+        # 如果指定了 required_count (比如14个)，就只取饱和度最高的14个
+        target_n = required_count if (required_count is not None and required_count > 0) else (rows * cols)
+        
+        if len(candidates) > target_n:
+            candidates = candidates[:target_n]
+            
+        # 提取出晋级的圆
+        accepted_circles = [c['data'] for c in candidates]
+        
+        # 第四步：将晋级的圆，重新按“几何位置”排序 (Row-Major)
+        # 这一步是为了给它们标上正确的 #1, #2...
+        accepted_circles = sorted(accepted_circles, key=lambda x: x[1]) # 先按Y排
+        
         for r in range(rows):
+            # 简单的行切分逻辑不够稳，这里用更稳健的 K-Means 思想切分行？
+            # 既然已经筛选过了，简单的数量切分通常就够了
             start_idx = r * cols
-            end_idx = min((r + 1) * cols, len(circles))
-            if start_idx < len(circles):
-                row_circles = circles[start_idx : end_idx]
+            end_idx = min((r + 1) * cols, len(accepted_circles))
+            if start_idx < len(accepted_circles):
+                row_circles = accepted_circles[start_idx : end_idx]
                 # 行内按X排
                 row_circles = sorted(row_circles, key=lambda x: x[0])
-                temp_sorted.extend(row_circles)
-        
-        # --- 关键修改：智能数量锁定 ---
-        # 如果用户指定了 required_count (例如11个)，我们就只取排序后的前11个
-        # 这样第12, 13, 14个空孔就会被直接丢弃，不画圈也不计算
-        if required_count is not None and required_count > 0:
-            if len(temp_sorted) > required_count:
-                temp_sorted = temp_sorted[:required_count]
-        
-        sorted_circles = temp_sorted
+                final_circles.extend(row_circles)
 
-        # 5. 提取 S 值 (带收缩系数)
+        # 5. 最终画图与取值
         roi_scale = 0.7 
         
-        for i, (x, y, r) in enumerate(sorted_circles):
+        for i, (x, y, r) in enumerate(final_circles):
             # 画图
             draw_r = int(r * roi_scale)
             cv2.circle(output_img, (x, y), draw_r, (0, 255, 0), 3)
             cv2.putText(output_img, f"{i+1}", (x-15, y+5), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            # 取色
+            # 取值
             sample_r = int(r * (roi_scale - 0.1)) 
             mask = np.zeros(img.shape[:2], dtype="uint8")
             cv2.circle(mask, (x, y), sample_r, 255, -1)
-            
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            mean_val = cv2.mean(hsv, mask=mask)
+            mean_val = cv2.mean(hsv_img, mask=mask)
             s_values.append(mean_val[1])
 
-    return output_img, s_values, len(sorted_circles)
+    return output_img, s_values, len(final_circles)
 
 # ==========================================
 # 2. 智能拟合引擎
@@ -274,6 +287,7 @@ with tab2:
                     "S-Value": [f"{v:.1f}" for v in s_test],
                     "Conc (mM)": [f"{c:.4f}" for c in results]
                 }, use_container_width=True)
+
 
 
 
