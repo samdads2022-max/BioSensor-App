@@ -1,4 +1,47 @@
- in group])
+import streamlit as st
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy import stats
+from PIL import Image, ImageOps
+
+# ==========================================
+# 1. 辅助算法：一维 K-Means 聚类 (抗歪斜核心)
+# ==========================================
+def robust_sort_circles(circles, rows):
+    """
+    最稳健的排序策略：
+    1. 用 K-Means 把 Y 坐标聚类成 N 行。
+    2. 计算每一行的平均 Y 值，确定行的上下顺序。
+    3. 在每一行内部，按 X 坐标排序。
+    """
+    if not circles: return []
+    
+    # 提取 Y 坐标
+    y_coords = np.array([c[1] for c in circles]).reshape(-1, 1)
+    
+    # 1. K-Means 聚类 (这里用 OpenCV 自带的，更稳)
+    # 如果检测到的圆少于行数，就设 K = 圆的数量
+    k = min(rows, len(circles))
+    if k <= 1:
+        # 只有一行，直接按 X 排序
+        return sorted(circles, key=lambda x: x[0])
+    
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+    _, labels, centers = cv2.kmeans(np.float32(y_coords), k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    
+    # 2. 将圆按 Label 分组
+    row_groups = {}
+    for i, label in enumerate(labels.flatten()):
+        if label not in row_groups: row_groups[label] = []
+        row_groups[label].append(circles[i])
+        
+    # 3. 确定行的上下顺序 (按每组的平均 Y 值排序)
+    # row_order 存储的是 [(label, avg_y), (label, avg_y)...]
+    row_stats = []
+    for label, group in row_groups.items():
+        avg_y = np.mean([c[1] for c in group])
         row_stats.append((label, avg_y))
     
     # 按 avg_y 从小到大排序 (Y小的是上面)
@@ -249,8 +292,6 @@ with tab2:
                 res = []
                 for v in t_vals: res.append(sel['inv_func'](v, *sel['params']))
                 st.dataframe({"Sample": range(1, len(res)+1), "Signal": [f"{v:.1f}" for v in t_vals], "Conc": [f"{c:.4f}" for c in res]})
-
-
 
 
 
