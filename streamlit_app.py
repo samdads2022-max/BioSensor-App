@@ -10,11 +10,9 @@ from PIL import Image, ImageOps
 # 1. 智能图像处理模块 (动态尺度版)
 # ==========================================
 def process_image(img_file_buffer, rows, cols):
-    # 读取并标准化图片
+    # 1. 标准化缩放
     image_pil = Image.open(img_file_buffer)
     image_pil = ImageOps.exif_transpose(image_pil)
-    
-    # 强制缩放到 1000px 宽
     target_width = 1000
     w_percent = (target_width / float(image_pil.size[0]))
     h_size = int((float(image_pil.size[1]) * float(w_percent)))
@@ -23,31 +21,24 @@ def process_image(img_file_buffer, rows, cols):
     
     output_img = img.copy()
     
-    # --- 改进点 1: 更精准的尺寸估算 ---
-    # 估算理论直径 (假设图片很紧凑，左右只留一点点边隙)
+    # 2. 动态参数计算
     approx_diameter = target_width / (cols + 0.5)
-    
-    # --- 改进点 2: 收紧半径范围 (防止圆太小或太大) ---
-    # 之前是 0.6，现在改成 0.75，过滤掉里面的小光圈
     dynamic_min_r = int(approx_diameter / 2 * 0.75) 
     dynamic_max_r = int(approx_diameter / 2 * 1.1)
-    
-    # --- 改进点 3: 严防重叠 (增大最小间距) ---
-    # 两个圆心的距离，至少要是直径的 0.85 倍。这样 #10 和 #12 就不可能叠在一起了
     min_dist_param = int(approx_diameter * 0.85)
     
-    # 图像增强
+    # 3. 图像增强
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced_gray = clahe.apply(gray)
     gray_blur = cv2.GaussianBlur(enhanced_gray, (9, 9), 2)
 
-    # 霍夫圆检测
+    # 4. 霍夫圆检测 (依然检测最稳定的外圈)
     circles = cv2.HoughCircles(
         gray_blur, cv2.HOUGH_GRADIENT, dp=1, 
-        minDist=min_dist_param,   # <--- 这里改大了，解决了重叠问题
+        minDist=min_dist_param,
         param1=50, 
-        param2=30,          # <--- 这里从 25 改到了 30，稍微迟钝一点，更稳
+        param2=30,
         minRadius=dynamic_min_r, 
         maxRadius=dynamic_max_r
     )
@@ -58,47 +49,47 @@ def process_image(img_file_buffer, rows, cols):
     if circles is not None:
         circles = np.round(circles[0, :]).astype("int")
         
-        # --- 智能网格排序 ---
-        # 1. 先按 Y 轴排序
+        # 排序与过滤逻辑
         circles = sorted(circles, key=lambda x: x[1])
-        
-        # 2. 过滤半径异常值
         if len(circles) > 0:
             median_r = np.median([c[2] for c in circles])
             circles = [c for c in circles if abs(c[2] - median_r) < median_r * 0.4]
         
-        # 3. 截取预期数量
         expected_total = rows * cols
         if len(circles) > expected_total:
-            # 如果还是找多了，优先取 Y 轴靠上的（通常背景杂质在下半部分）
-            # 或者更复杂的逻辑，这里先简单截取
              circles = circles[:expected_total]
 
-        # 4. 逐行排序逻辑优化 (防止一行多一行少)
-        # 我们使用 K-Means 的思想简单分行：根据 Y 坐标聚类
-        # 但对于固定行数，我们可以直接按 Y 坐标切分
-        circles = sorted(circles, key=lambda x: x[1]) # 再次确保按 Y 排序
-        
+        circles = sorted(circles, key=lambda x: x[1])
         for r in range(rows):
-            # 每一行取 cols 个
             start_idx = r * cols
             end_idx = min((r + 1) * cols, len(circles))
-            
             if start_idx < len(circles):
-                # 取出这一批，按 X 轴排序
-                row_subset = circles[start_idx : end_idx]
-                row_subset = sorted(row_subset, key=lambda x: x[0])
-                sorted_circles.extend(row_subset)
+                row_circles = sorted(circles[start_idx:end_idx], key=lambda x: x[0])
+                sorted_circles.extend(row_circles)
 
-        # 5. 提取 S 值
+        # 5. 提取 S 值 (关键修改在这里！)
+        # 定义收缩系数：0.7 表示只取中间 70% 的区域
+        # 你可以根据实际情况微调这个数 (0.6 - 0.8)
+        roi_scale = 0.7 
+        
         for i, (x, y, r) in enumerate(sorted_circles):
-            cv2.circle(output_img, (x, y), r, (0, 255, 0), 4)
+            # --- 视觉修正 ---
+            # r 是外圈半径，draw_r 是我们画在图上的半径
+            draw_r = int(r * roi_scale)
+            
+            # 画圆 (使用收缩后的半径)
+            cv2.circle(output_img, (x, y), draw_r, (0, 255, 0), 3)
             cv2.putText(output_img, f"{i+1}", (x-15, y+5), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
+            # --- 数据提取修正 ---
+            # 采样半径：为了数据纯净，通常比画的圈再小一点点 (比如 0.5)
+            # 这样能避开纸片边缘可能存在的阴影
+            sample_r = int(r * (roi_scale - 0.1)) 
+            
             mask = np.zeros(img.shape[:2], dtype="uint8")
-            # 采样半径缩小一点，只取圆心最纯净的颜色
-            cv2.circle(mask, (x, y), int(r * 0.5), 255, -1)
+            cv2.circle(mask, (x, y), sample_r, 255, -1)
+            
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             mean_val = cv2.mean(hsv, mask=mask)
             s_values.append(mean_val[1])
@@ -305,4 +296,5 @@ with tab2:
                     "S-Value": [f"{v:.1f}" for v in s_test],
                     "Conc (mM)": [f"{c:.4f}" for c in results]
                 }, use_container_width=True)
+
 
