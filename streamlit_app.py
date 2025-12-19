@@ -76,7 +76,7 @@ def process_image(img_file_buffer, rows, cols, required_count=None, analysis_mod
     approx_diameter = target_width / (cols + 0.5)
     dynamic_min_r = int(approx_diameter / 2 * 0.7)
     dynamic_max_r = int(approx_diameter / 2 * 1.2)
-    min_dist_param = int(approx_diameter * 0.8) # 严防重叠
+    min_dist_param = int(approx_diameter * 0.8)
     
     # 3. 霍夫检测
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -116,35 +116,49 @@ def process_image(img_file_buffer, rows, cols, required_count=None, analysis_mod
             score = cv2.mean(score_img, mask=mask)[0]
             candidates.append({'data': (x, y, r), 'score': score})
         
-        # 优胜劣汰
+        # --- 步骤 B: 筛选逻辑重构 (关键修改) ---
+        
+        # 1. 按分数排序
         candidates.sort(key=lambda k: k['score'], reverse=True)
-        target_n = required_count if (required_count and required_count > 0) else (rows * cols)
-        if len(candidates) > target_n:
-            candidates = candidates[:target_n]
+        
+        # 2. 先保留“满板”数量的圆 (Rows * Cols)
+        #    注意：这里先不应用用户的 required_count，而是先填满网格。
+        #    这样可以保证颜色浅的孔（只要比背景强）也能入选。
+        max_possible_slots = rows * cols
+        if len(candidates) > max_possible_slots:
+            candidates = candidates[:max_possible_slots]
         
         accepted_circles = [c['data'] for c in candidates]
         
-        # --- 步骤 B: 智能排序 (修复版) ---
-        # 使用 K-Means 分行，然后行内排序，彻底解决乱序
-        final_circles = robust_sort_circles(accepted_circles, rows)
+        # --- 步骤 C: 空间排序 (从上到下，从左到右) ---
+        # 此时我们手里的圆是乱序的，但数量是对的（或者包含了所有有效孔）
+        spatial_sorted_circles = robust_sort_circles(accepted_circles, rows)
 
-        # --- 步骤 C: 取值与画图 ---
+        # --- 步骤 D: 用户截断 (Apply Limit) ---
+        # 排序完成后，再根据用户滑块的数值，从尾部切断
+        # 这样就能保证减去的一定是最后几个孔
+        if required_count is not None and required_count > 0:
+            if len(spatial_sorted_circles) > required_count:
+                final_circles = spatial_sorted_circles[:required_count]
+            else:
+                final_circles = spatial_sorted_circles
+        else:
+            final_circles = spatial_sorted_circles
+
+        # --- 步骤 E: 取值与画图 ---
         roi_scale = 0.7 
         for i, (x, y, r) in enumerate(final_circles):
-            # 画图
             draw_r = int(r * roi_scale)
             cv2.circle(output_img, (x, y), draw_r, (0, 255, 0), 3)
             cv2.putText(output_img, f"{i+1}", (x-15, y+5), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            # 取值
             mask = np.zeros(img.shape[:2], dtype="uint8")
             cv2.circle(mask, (x, y), int(r * (roi_scale - 0.1)), 255, -1)
             mean_val = cv2.mean(score_img, mask=mask)[0]
             s_values.append(mean_val)
 
     return output_img, s_values, len(final_circles)
-
 # ==========================================
 # 3. 拟合引擎 (修复 min_pts 作用域问题)
 # ==========================================
@@ -292,6 +306,7 @@ with tab2:
                 res = []
                 for v in t_vals: res.append(sel['inv_func'](v, *sel['params']))
                 st.dataframe({"Sample": range(1, len(res)+1), "Signal": [f"{v:.1f}" for v in t_vals], "Conc": [f"{c:.4f}" for c in res]})
+
 
 
 
